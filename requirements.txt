@@ -1,0 +1,7 @@
+
+websockets
+python-telegram-bot
+requests
+pandas
+pandas-ta
+pytz
