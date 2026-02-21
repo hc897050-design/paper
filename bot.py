@@ -18,8 +18,9 @@ STAGE1_SL_TRAIL = 0.8
 STAGE2_SL_TRAIL = 1.5
 
 # ==================== STATS ====================
+# ── Fill these with your real values before running ──
 stats = {
-    "balance"      : 00,
+    "balance"      : 100,
     "risk_percent" : 0.02,
     "total_trades" : 00,
     "win_s3"       : 00,
@@ -47,25 +48,43 @@ def log(tag, msg):
     Structured console log. Every event prints with:
       [HH:MM:SS.mmm] [TAG] message
     Tags:
-      WS       → raw WebSocket events
-      CANDLE   → candle close events
-      SIGNAL   → entry signal checks (crossover logic)
-      INDIC    → raw indicator values every candle close
-      TRADE    → trade open/close/stage events
-      LOCK     → lock acquire/release events
-      ERROR    → any exception
+      WS     → raw WebSocket events
+      CANDLE → candle close events
+      SIGNAL → entry signal checks (crossover logic)
+      INDIC  → raw indicator values every candle close
+      TRADE  → trade open/close/stage events
+      LOCK   → lock acquire/release events
+      ERROR  → any exception
     """
-    line = f"[{now()}] [{tag:<7}] {msg}"
-    print(line)
+    print(f"[{now()}] [{tag:<7}] {msg}")
 
 # ==================== DATA & INDICATORS ====================
 
 async def fetch_indicators():
+    """
+    FIX 1 — limit=1000 (RSI convergence):
+      RSI(40) needs ~400+ candles to stabilize and match TradingView.
+      Previous limit=200 was in the initialization zone causing RSI
+      values to diverge by 1-3 points. 1000 is the Binance max and
+      gives full convergence identical to TradingView.
+
+    FIX 2 — iloc[-2] / iloc[-3] (no forming candle):
+      After the 3M close event fires and our HTTP round-trip completes,
+      Binance REST has already opened a new forming candle at iloc[-1].
+      iloc[-2] = just-closed confirmed candle  ← current
+      iloc[-3] = candle before that            ← previous
+      iloc[-1] = new forming candle            ← never use
+
+    NOTE: @kline_3m stream already matches interval='3m' so there
+    is no live repainting issue — signal fires exactly once per
+    3M close, identical to TradingView behaviour.
+    """
     try:
         url    = "https://api.binance.com/api/v3/klines"
-        params = {'symbol': SYMBOL, 'interval': '3m', 'limit': 200}
+        # FIX 1: 1000 candles for full RSI(40) convergence
+        params = {'symbol': SYMBOL, 'interval': '3m', 'limit': 1000}
 
-        log("INDIC", f"Fetching {SYMBOL} 3m klines (limit=200)...")
+        log("INDIC", f"Fetching {SYMBOL} 3m klines (limit=1000)...")
         resp = await http_client.get(url, params=params)
         data = resp.json()
         log("INDIC", f"Received {len(data)} candles from Binance REST")
@@ -76,24 +95,20 @@ async def fetch_indicators():
         rsi = ta.rsi(df['close'], length=RSI_P)
         wma = ta.wma(rsi,         length=WMA_P)
 
-        # Log the last 3 candles so you can compare with TradingView
+        # Log last 3 confirmed candles — compare these directly with TradingView
         log("INDIC", "─── Last 3 confirmed candles (iloc -4, -3, -2) ───")
         for i, idx in enumerate([-4, -3, -2], start=1):
-            ts_ms   = int(df['ts'].iloc[idx])
-            ts_str  = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%H:%M")
-            c_price = df['close'].iloc[idx]
-            r_val   = rsi.iloc[idx]
-            w_val   = wma.iloc[idx]
-            log("INDIC", f"  Candle {i}: {ts_str} UTC | close={c_price:.4f} | RSI={r_val:.4f} | WMA={w_val:.4f}")
+            ts_ms  = int(df['ts'].iloc[idx])
+            ts_str = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%H:%M")
+            log("INDIC", f"  Candle {i}: {ts_str} UTC | close={df['close'].iloc[idx]:.4f} | RSI={rsi.iloc[idx]:.4f} | WMA={wma.iloc[idx]:.4f}")
 
-        # iloc[-2] = just-closed candle
-        # iloc[-3] = candle before that
-        curr_rsi  = rsi.iloc[-2]
-        curr_wma  = wma.iloc[-2]
-        prev_rsi  = rsi.iloc[-3]
-        prev_wma  = wma.iloc[-3]
+        # FIX 2: use iloc[-2] and iloc[-3], skip forming candle at iloc[-1]
+        curr_rsi = rsi.iloc[-2]
+        curr_wma = wma.iloc[-2]
+        prev_rsi = rsi.iloc[-3]
+        prev_wma = wma.iloc[-3]
 
-        log("INDIC", f"─── Crossover check ───")
+        log("INDIC", "─── Crossover check ───")
         log("INDIC", f"  PREV: RSI={prev_rsi:.4f}  WMA={prev_wma:.4f}  | RSI<=WMA? {prev_rsi <= prev_wma}")
         log("INDIC", f"  CURR: RSI={curr_rsi:.4f}  WMA={curr_wma:.4f}  | RSI>WMA?  {curr_rsi > curr_wma}")
         log("INDIC", f"  CROSSOVER = {(prev_rsi <= prev_wma) and (curr_rsi > curr_wma)}")
@@ -137,6 +152,11 @@ def _stats_footer():
 # ==================== TRADE ENGINE ====================
 
 async def monitor_trade(price, bot):
+    """
+    Runs on every WebSocket tick while trade is open.
+    s1/s2 boolean flags guarantee each stage fires exactly once.
+    closing_lock guarantees close_trade() fires at most once per trade.
+    """
     global active_trade, stats
 
     if not active_trade:
@@ -152,7 +172,7 @@ async def monitor_trade(price, bot):
 
     rr = (price - entry) / risk_dist
 
-    # Stage 1
+    # ── STAGE 1: 1.5R → trail SL to +0.8R, no position exit ──
     if not active_trade['s1'] and rr >= STAGE1_R:
         active_trade['s1'] = True
         active_trade['sl'] = entry + (risk_dist * STAGE1_SL_TRAIL)
@@ -169,7 +189,7 @@ async def monitor_trade(price, bot):
             f"ℹ️ _Waiting for Stage 2 at 2.2R..._"
         )
 
-    # Stage 2
+    # ── STAGE 2: 2.2R → exit 50%, trail SL to +1.5R ──────────
     elif not active_trade['s2'] and rr >= STAGE2_R:
         active_trade['s2'] = True
         active_trade['sl'] = entry + (risk_dist * STAGE2_SL_TRAIL)
@@ -196,7 +216,7 @@ async def monitor_trade(price, bot):
             f"ℹ️ _Waiting for Stage 3 at 3.0R..._"
         )
 
-    # Exit conditions
+    # ── EXIT CONDITIONS ────────────────────────────────────────
     if rr >= STAGE3_R:
         async with closing_lock:
             if active_trade and not active_trade.get('closing'):
@@ -219,6 +239,11 @@ async def monitor_trade(price, bot):
 
 
 async def close_trade(exit_price, reason, bot):
+    """
+    All stat mutations happen synchronously before any await.
+    active_trade = None is set BEFORE await tg() so any new candle
+    close arriving during the Telegram send correctly sees no open trade.
+    """
     global active_trade, stats
 
     entry          = active_trade['entry']
@@ -229,6 +254,7 @@ async def close_trade(exit_price, reason, bot):
     remaining_pnl  = (active_trade['risk_usd'] * remaining_mult) * rr
     total_pnl      = remaining_pnl + active_trade.get('realized_pnl', 0)
 
+    # ── All mutations before any await ────────────────────────
     stats['balance']      += remaining_pnl
     stats['total_trades'] += 1
 
@@ -264,6 +290,7 @@ async def close_trade(exit_price, reason, bot):
 
     log("TRADE", f"CLOSED — {outcome_label} | exit={exit_price:.4f} | rr={rr:.2f}R | pnl={total_pnl:+.2f} USDT | balance={stats['balance']:.2f}")
 
+    # ── Nullify BEFORE await so next signal isn't blocked ─────
     active_trade = None
 
     pnl_sign = "+" if total_pnl >= 0 else ""
@@ -282,9 +309,16 @@ async def close_trade(exit_price, reason, bot):
 # ==================== ENTRY HANDLER ====================
 
 async def handle_candle_close(price, closed_low, bot):
+    """
+    Called only on confirmed 3M candle close (data['k']['x'] = True).
+    entry_lock prevents two simultaneous close events both opening a trade.
+
+    closed_low = data['k']['l'] from WebSocket event — the low of the
+    candle that JUST closed, final and accurate. No extra REST call needed.
+    """
     global active_trade
 
-    log("CANDLE", f"Candle closed | close={price:.4f} | low={closed_low:.4f}")
+    log("CANDLE", f"3M candle closed | close={price:.4f} | low={closed_low:.4f}")
 
     async with entry_lock:
         log("LOCK", "entry_lock acquired")
@@ -296,15 +330,16 @@ async def handle_candle_close(price, closed_low, bot):
 
         rsi, wma, prsi, pwma = await fetch_indicators()
 
+        # `rsi is not None` not `if rsi` — RSI=0.0 is valid but falsy in Python.
+        # `if rsi` would silently skip a real signal in that edge case.
         if rsi is None:
             log("SIGNAL", "SKIP — indicator fetch returned None (API error)")
             log("LOCK", "entry_lock released")
             return
 
-        # ── The exact same crossover logic TradingView uses ──
-        # prev candle: RSI was BELOW or EQUAL to WMA  (prsi <= pwma)
-        # curr candle: RSI is NOW ABOVE WMA            (rsi > wma)
-        # Together: RSI just crossed UP through WMA
+        # Crossover: RSI crossed UP through WMA on the just-closed candle
+        # prev candle: RSI was at or below WMA  (prsi <= pwma)
+        # curr candle: RSI is now above WMA     (rsi  >  wma)
         crossover = (prsi <= pwma) and (rsi > wma)
 
         log("SIGNAL", f"RSI={rsi:.4f} | WMA={wma:.4f} | prevRSI={prsi:.4f} | prevWMA={pwma:.4f}")
@@ -315,11 +350,11 @@ async def handle_candle_close(price, closed_low, bot):
             log("LOCK", "entry_lock released")
             return
 
-        low_val   = closed_low * 0.9995
+        low_val   = closed_low * 0.9995   # small buffer below candle low
         risk_dist = price - low_val
 
         if risk_dist <= 0:
-            log("SIGNAL", f"SKIP — invalid risk distance ({risk_dist:.4f}), entry=SL")
+            log("SIGNAL", f"SKIP — invalid risk distance ({risk_dist:.6f})")
             log("LOCK", "entry_lock released")
             return
 
@@ -338,7 +373,7 @@ async def handle_candle_close(price, closed_low, bot):
         log("TRADE", f"TRADE OPENED | entry={price:.4f} | sl={low_val:.4f} | risk={active_trade['risk_usd']:.2f} USDT")
         log("LOCK", "entry_lock released")
 
-    # Send alert OUTSIDE lock
+    # Send alert OUTSIDE lock — never hold lock during network I/O
     await tg(bot,
         f"🚀 *LONG SIGNAL — {SYMBOL}*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -360,12 +395,19 @@ async def main():
     async with telegram.Bot(TELEGRAM_TOKEN) as bot:
         ws_url = f"wss://stream.binance.com:9443/ws/{SYMBOL.lower()}@kline_3m"
 
+        # Outer loop reconnects automatically on any disconnect
         while True:
             try:
                 log("WS", f"Connecting to {ws_url}...")
                 async with websockets.connect(ws_url) as ws:
                     log("WS", "Connected.")
-                    await tg(bot, f"🤖 *Bot Started*\n└ Monitoring `{SYMBOL}` on `3M` timeframe")
+                    await tg(bot,
+                        f"🤖 *Bot Started*\n"
+                        f"├ Symbol:    `{SYMBOL}`\n"
+                        f"├ Timeframe: `3M`\n"
+                        f"├ RSI:       `{RSI_P}` | WMA: `{WMA_P}`\n"
+                        f"└ Balance:   `${stats['balance']:.2f}`"
+                    )
 
                     while True:
                         raw  = await ws.recv()
@@ -377,12 +419,11 @@ async def main():
                         price    = float(data['k']['c'])
                         is_close = data['k']['x']
 
-                        # Log every tick briefly (comment out if too noisy)
-                        # log("WS", f"tick | price={price:.4f} | candle_closed={is_close}")
-
+                        # Monitor open trade on every tick
                         if active_trade:
                             await monitor_trade(price, bot)
 
+                        # Only act on confirmed 3M candle close
                         if is_close:
                             closed_low = float(data['k']['l'])
                             await handle_candle_close(price, closed_low, bot)
