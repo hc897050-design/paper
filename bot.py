@@ -1,6 +1,7 @@
 import asyncio, websockets, json, telegram, httpx, sys
 import pandas as pd
 import pandas_ta as ta
+from datetime import datetime
 
 # ==================== CONFIG ====================
 TELEGRAM_TOKEN = '8349229275:AAGNWV2A0_Pf9LhlwZCczeBoMcUaJL2shFg'
@@ -10,62 +11,64 @@ SYMBOL         = 'SOLUSDT'
 RSI_P, WMA_P = 40, 15
 
 # ==================== STAGE CONFIG ====================
-STAGE1_R        = 1.5   # trail SL only, no exit
-STAGE2_R        = 2.2   # exit 50%, trail SL
-STAGE3_R        = 3.0   # exit remaining 50%, close trade
-
-STAGE1_SL_TRAIL = 0.8   # SL → +0.8R after stage 1
-STAGE2_SL_TRAIL = 1.5   # SL → +1.5R after stage 2
+STAGE1_R        = 1.5
+STAGE2_R        = 2.2
+STAGE3_R        = 3.0
+STAGE1_SL_TRAIL = 0.8
+STAGE2_SL_TRAIL = 1.5
 
 # ==================== STATS ====================
 stats = {
-    "balance"      : 100,
+    "balance"      : 00,
     "risk_percent" : 0.02,
-
     "total_trades" : 00,
-    "win_s3"       : 00,   # full target hit (Stage 3)
-    "win_partial"  : 00,   # net positive but SL hit before Stage 3
-    "loss_sl"      : 00,   # SL hit before any exit
-
+    "win_s3"       : 00,
+    "win_partial"  : 00,
+    "loss_sl"      : 00,
     "reached_s1"   : 0,
     "reached_s2"   : 0,
     "reached_s3"   : 0,
-
-    "sl_points"    : 0.0,  # cumulative price distance lost on SL trades
-    "tp_points"    : 0.0,  # cumulative price distance captured on exits
+    "sl_points"    : 0.0,
+    "tp_points"    : 0.0,
 }
 
 active_trade = None
 http_client  = httpx.AsyncClient()
-
-# ==================== LOCKS ====================
-# entry_lock  : prevents two simultaneous candle-close events
-#               from both seeing active_trade=None and opening two trades
-# closing_lock: prevents two simultaneous ticks from both triggering
-#               close_trade() at the same moment
 entry_lock   = asyncio.Lock()
 closing_lock = asyncio.Lock()
+
+# ==================== LOGGER ====================
+
+def now():
+    return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+def log(tag, msg):
+    """
+    Structured console log. Every event prints with:
+      [HH:MM:SS.mmm] [TAG] message
+    Tags:
+      WS       → raw WebSocket events
+      CANDLE   → candle close events
+      SIGNAL   → entry signal checks (crossover logic)
+      INDIC    → raw indicator values every candle close
+      TRADE    → trade open/close/stage events
+      LOCK     → lock acquire/release events
+      ERROR    → any exception
+    """
+    line = f"[{now()}] [{tag:<7}] {msg}"
+    print(line)
 
 # ==================== DATA & INDICATORS ====================
 
 async def fetch_indicators():
-    """
-    FIX — repainting:
-      iloc[-2] = just-closed candle (confirmed, final values)
-      iloc[-3] = candle before that (for crossover comparison)
-      iloc[-1] is intentionally skipped — it is the NEW forming candle
-      that exists by the time our HTTP response arrives after the close event.
-
-    FIX — RSI warmup:
-      limit=200 gives RSI(40) enough history to stabilize.
-      limit=100 puts RSI in its initialization zone, causing divergence
-      from TradingView/Binance chart values.
-    """
     try:
         url    = "https://api.binance.com/api/v3/klines"
         params = {'symbol': SYMBOL, 'interval': '3m', 'limit': 200}
-        resp   = await http_client.get(url, params=params)
-        data   = resp.json()
+
+        log("INDIC", f"Fetching {SYMBOL} 3m klines (limit=200)...")
+        resp = await http_client.get(url, params=params)
+        data = resp.json()
+        log("INDIC", f"Received {len(data)} candles from Binance REST")
 
         df          = pd.DataFrame(data, columns=['ts','o','h','l','c','v','ts_e','q','n','tb','tq','i'])
         df['close'] = df['c'].astype(float)
@@ -73,10 +76,32 @@ async def fetch_indicators():
         rsi = ta.rsi(df['close'], length=RSI_P)
         wma = ta.wma(rsi,         length=WMA_P)
 
-        return rsi.iloc[-2], wma.iloc[-2], rsi.iloc[-3], wma.iloc[-3]
+        # Log the last 3 candles so you can compare with TradingView
+        log("INDIC", "─── Last 3 confirmed candles (iloc -4, -3, -2) ───")
+        for i, idx in enumerate([-4, -3, -2], start=1):
+            ts_ms   = int(df['ts'].iloc[idx])
+            ts_str  = datetime.utcfromtimestamp(ts_ms / 1000).strftime("%H:%M")
+            c_price = df['close'].iloc[idx]
+            r_val   = rsi.iloc[idx]
+            w_val   = wma.iloc[idx]
+            log("INDIC", f"  Candle {i}: {ts_str} UTC | close={c_price:.4f} | RSI={r_val:.4f} | WMA={w_val:.4f}")
+
+        # iloc[-2] = just-closed candle
+        # iloc[-3] = candle before that
+        curr_rsi  = rsi.iloc[-2]
+        curr_wma  = wma.iloc[-2]
+        prev_rsi  = rsi.iloc[-3]
+        prev_wma  = wma.iloc[-3]
+
+        log("INDIC", f"─── Crossover check ───")
+        log("INDIC", f"  PREV: RSI={prev_rsi:.4f}  WMA={prev_wma:.4f}  | RSI<=WMA? {prev_rsi <= prev_wma}")
+        log("INDIC", f"  CURR: RSI={curr_rsi:.4f}  WMA={curr_wma:.4f}  | RSI>WMA?  {curr_rsi > curr_wma}")
+        log("INDIC", f"  CROSSOVER = {(prev_rsi <= prev_wma) and (curr_rsi > curr_wma)}")
+
+        return curr_rsi, curr_wma, prev_rsi, prev_wma
 
     except Exception as e:
-        print(f"[fetch_indicators ERROR] {e}")
+        log("ERROR", f"fetch_indicators failed: {e}")
         return None, None, None, None
 
 # ==================== TELEGRAM ====================
@@ -112,20 +137,10 @@ def _stats_footer():
 # ==================== TRADE ENGINE ====================
 
 async def monitor_trade(price, bot):
-    """
-    Called on every WebSocket tick while a trade is open.
-    Uses closing_lock to guarantee close_trade() is called
-    at most once per trade, even if multiple ticks arrive
-    simultaneously during an async await.
-    """
     global active_trade, stats
 
-    # Primary guard — no trade open
     if not active_trade:
         return
-
-    # Secondary guard — trade is already being closed
-    # (closing_lock is held by another tick's close_trade call)
     if active_trade.get('closing'):
         return
 
@@ -137,13 +152,12 @@ async def monitor_trade(price, bot):
 
     rr = (price - entry) / risk_dist
 
-    # ── STAGE 1: 1.5R ──────────────────────────────────────
-    # Guard: active_trade['s1'] flag ensures this block runs
-    # exactly once regardless of how many ticks see rr >= 1.5
+    # Stage 1
     if not active_trade['s1'] and rr >= STAGE1_R:
         active_trade['s1'] = True
         active_trade['sl'] = entry + (risk_dist * STAGE1_SL_TRAIL)
         stats['reached_s1'] += 1
+        log("TRADE", f"STAGE 1 HIT | price={price:.4f} | rr={rr:.2f}R | new SL={active_trade['sl']:.4f}")
 
         await tg(bot,
             f"🟢 *STAGE 1 HIT — {SYMBOL}*\n"
@@ -155,10 +169,7 @@ async def monitor_trade(price, bot):
             f"ℹ️ _Waiting for Stage 2 at 2.2R..._"
         )
 
-    # ── STAGE 2: 2.2R ──────────────────────────────────────
-    # Guard: active_trade['s2'] flag ensures this block runs
-    # exactly once. Balance, tp_points, realized_pnl all
-    # update here and only here for the 50% exit.
+    # Stage 2
     elif not active_trade['s2'] and rr >= STAGE2_R:
         active_trade['s2'] = True
         active_trade['sl'] = entry + (risk_dist * STAGE2_SL_TRAIL)
@@ -168,8 +179,9 @@ async def monitor_trade(price, bot):
         active_trade['s2_exit_price'] = price
 
         stats['balance']    += realized
-        stats['tp_points']  += (price - entry) * 0.5   # 50% of position
+        stats['tp_points']  += (price - entry) * 0.5
         stats['reached_s2'] += 1
+        log("TRADE", f"STAGE 2 HIT | price={price:.4f} | rr={rr:.2f}R | realized={realized:.2f} USDT | new SL={active_trade['sl']:.4f}")
 
         await tg(bot,
             f"💰 *STAGE 2 HIT — {SYMBOL}*\n"
@@ -184,18 +196,12 @@ async def monitor_trade(price, bot):
             f"ℹ️ _Waiting for Stage 3 at 3.0R..._"
         )
 
-    # ── EXIT CONDITIONS ─────────────────────────────────────
-    # closing_lock ensures only ONE tick can ever enter
-    # close_trade(). Any other tick that arrives during the
-    # await inside close_trade() will see the lock is held
-    # and skip silently. This is the core one-trade guarantee.
-
+    # Exit conditions
     if rr >= STAGE3_R:
         async with closing_lock:
-            # Re-check inside lock — another tick may have
-            # already closed the trade while we waited
             if active_trade and not active_trade.get('closing'):
                 active_trade['closing'] = True
+                log("TRADE", f"STAGE 3 HIT — closing | price={price:.4f} | rr={rr:.2f}R")
                 await close_trade(price, "S3_TARGET", bot)
 
     elif price <= active_trade['sl']:
@@ -203,33 +209,26 @@ async def monitor_trade(price, bot):
             if active_trade and not active_trade.get('closing'):
                 active_trade['closing'] = True
                 if active_trade['s2']:
-                    await close_trade(price, "SL_AFTER_S2", bot)
+                    reason = "SL_AFTER_S2"
                 elif active_trade['s1']:
-                    await close_trade(price, "SL_AFTER_S1", bot)
+                    reason = "SL_AFTER_S1"
                 else:
-                    await close_trade(price, "SL_PURE", bot)
+                    reason = "SL_PURE"
+                log("TRADE", f"SL HIT — {reason} | price={price:.4f} | sl={active_trade['sl']:.4f} | rr={rr:.2f}R")
+                await close_trade(price, reason, bot)
 
 
 async def close_trade(exit_price, reason, bot):
-    """
-    Called at most once per trade (enforced by closing_lock +
-    active_trade['closing'] flag in monitor_trade).
-    All stats updates happen here atomically before any await.
-    """
     global active_trade, stats
 
-    entry      = active_trade['entry']
-    initial_sl = active_trade['initial_sl']
-    risk_dist  = entry - initial_sl
-    rr         = (exit_price - entry) / risk_dist
-
+    entry          = active_trade['entry']
+    initial_sl     = active_trade['initial_sl']
+    risk_dist      = entry - initial_sl
+    rr             = (exit_price - entry) / risk_dist
     remaining_mult = 0.5 if active_trade['s2'] else 1.0
     remaining_pnl  = (active_trade['risk_usd'] * remaining_mult) * rr
     total_pnl      = remaining_pnl + active_trade.get('realized_pnl', 0)
 
-    # ── Update all stats BEFORE any await ──────────────────
-    # Doing all mutations here synchronously means no other
-    # coroutine can interleave and see a half-updated state.
     stats['balance']      += remaining_pnl
     stats['total_trades'] += 1
 
@@ -263,15 +262,12 @@ async def close_trade(exit_price, reason, bot):
         outcome_emoji = "🛑"
         outcome_label = "LOSS — Initial SL Hit"
 
-    # ── Nullify trade BEFORE await ──────────────────────────
-    # Setting active_trade = None here (before the Telegram
-    # await) means any new candle close that arrives while
-    # the message is sending will correctly see no open trade
-    # and can safely open a new one via entry_lock.
+    log("TRADE", f"CLOSED — {outcome_label} | exit={exit_price:.4f} | rr={rr:.2f}R | pnl={total_pnl:+.2f} USDT | balance={stats['balance']:.2f}")
+
     active_trade = None
 
     pnl_sign = "+" if total_pnl >= 0 else ""
-    msg = (
+    await tg(bot,
         f"{outcome_emoji} *TRADE CLOSED — {outcome_label}*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry:        `${entry:.4f}`\n"
@@ -282,46 +278,49 @@ async def close_trade(exit_price, reason, bot):
         f"🏦 New Balance:  `${stats['balance']:.2f}`"
         + _stats_footer()
     )
-    await tg(bot, msg)
-
 
 # ==================== ENTRY HANDLER ====================
 
 async def handle_candle_close(price, closed_low, bot):
-    """
-    Wrapped in entry_lock so that even if two candle-close
-    events fire nearly simultaneously (network burst, reconnect
-    overlap), only one can check active_trade and open a trade
-    at a time. The second one will wait at the lock, then see
-    active_trade is already set and skip.
-    """
     global active_trade
 
+    log("CANDLE", f"Candle closed | close={price:.4f} | low={closed_low:.4f}")
+
     async with entry_lock:
-        # Already in a trade — skip
+        log("LOCK", "entry_lock acquired")
+
         if active_trade:
+            log("SIGNAL", f"SKIP — trade already open (entry={active_trade['entry']:.4f})")
+            log("LOCK", "entry_lock released")
             return
 
         rsi, wma, prsi, pwma = await fetch_indicators()
 
-        # FIX: `rsi is not None` not `if rsi` — RSI=0.0 is valid
-        # and falsy, so `if rsi` would silently skip a real signal
         if rsi is None:
-            print("[BOT] Indicator fetch failed, skipping candle.")
+            log("SIGNAL", "SKIP — indicator fetch returned None (API error)")
+            log("LOCK", "entry_lock released")
             return
 
+        # ── The exact same crossover logic TradingView uses ──
+        # prev candle: RSI was BELOW or EQUAL to WMA  (prsi <= pwma)
+        # curr candle: RSI is NOW ABOVE WMA            (rsi > wma)
+        # Together: RSI just crossed UP through WMA
         crossover = (prsi <= pwma) and (rsi > wma)
+
+        log("SIGNAL", f"RSI={rsi:.4f} | WMA={wma:.4f} | prevRSI={prsi:.4f} | prevWMA={pwma:.4f}")
+        log("SIGNAL", f"prsi<=pwma: {prsi <= pwma} | rsi>wma: {rsi > wma} | CROSSOVER: {crossover}")
+
         if not crossover:
+            log("SIGNAL", "SKIP — no crossover this candle")
+            log("LOCK", "entry_lock released")
             return
 
-        # FIX: closed candle low comes from WebSocket event data['k']['l']
-        # NOT from a separate REST call with limit=1, which returns the
-        # currently forming candle (wrong values, wrong candle entirely)
         low_val   = closed_low * 0.9995
         risk_dist = price - low_val
 
         if risk_dist <= 0:
-            print("[BOT] Invalid risk distance, skipping.")
+            log("SIGNAL", f"SKIP — invalid risk distance ({risk_dist:.4f}), entry=SL")
+            log("LOCK", "entry_lock released")
             return
 
         active_trade = {
@@ -336,7 +335,10 @@ async def handle_candle_close(price, closed_low, bot):
             's2_exit_price': None,
         }
 
-    # Send alert OUTSIDE the lock so we don't hold it during network I/O
+        log("TRADE", f"TRADE OPENED | entry={price:.4f} | sl={low_val:.4f} | risk={active_trade['risk_usd']:.2f} USDT")
+        log("LOCK", "entry_lock released")
+
+    # Send alert OUTSIDE lock
     await tg(bot,
         f"🚀 *LONG SIGNAL — {SYMBOL}*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -352,7 +354,6 @@ async def handle_candle_close(price, closed_low, bot):
         f"📊 RSI: `{rsi:.2f}` | WMA: `{wma:.2f}`"
     )
 
-
 # ==================== MAIN LOOP ====================
 
 async def main():
@@ -361,9 +362,9 @@ async def main():
 
         while True:
             try:
-                print(f"[BOT] Connecting...")
+                log("WS", f"Connecting to {ws_url}...")
                 async with websockets.connect(ws_url) as ws:
-                    print(f"[BOT] Connected. Monitoring {SYMBOL} 3M.")
+                    log("WS", "Connected.")
                     await tg(bot, f"🤖 *Bot Started*\n└ Monitoring `{SYMBOL}` on `3M` timeframe")
 
                     while True:
@@ -373,22 +374,24 @@ async def main():
                         if 'k' not in data:
                             continue
 
-                        price = float(data['k']['c'])
+                        price    = float(data['k']['c'])
+                        is_close = data['k']['x']
 
-                        # Monitor open trade on every tick
+                        # Log every tick briefly (comment out if too noisy)
+                        # log("WS", f"tick | price={price:.4f} | candle_closed={is_close}")
+
                         if active_trade:
                             await monitor_trade(price, bot)
 
-                        # Handle candle close
-                        if data['k']['x']:
+                        if is_close:
                             closed_low = float(data['k']['l'])
                             await handle_candle_close(price, closed_low, bot)
 
             except websockets.ConnectionClosed as e:
-                print(f"[BOT] WebSocket closed: {e}. Reconnecting in 5s...")
+                log("WS", f"Connection closed: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
             except Exception as e:
-                print(f"[BOT] Error: {e}. Reconnecting in 10s...")
+                log("ERROR", f"Unexpected error: {e}. Reconnecting in 10s...")
                 await asyncio.sleep(10)
 
 
@@ -396,5 +399,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("[BOT] Stopped.")
+        log("WS", "Bot stopped by user.")
         sys.exit()
